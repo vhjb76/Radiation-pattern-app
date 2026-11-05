@@ -1,0 +1,7 @@
+# Cut Type: Phi Cut (φ)
+# Path Loss Compensation Offset (dB): 28.48
+Angle_deg,Power_dBm,Power_dBm_Raw,Timestamp
+0.0,29.54,1.06,10:33:39
+15.0,28.46,-0.02,10:33:44
+30.0,25.63,-2.85,10:33:49
+45.0,21.97,-6.51,10:33:54

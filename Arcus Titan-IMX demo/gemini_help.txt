@@ -1,0 +1,186 @@
+The Arcus TITAN-IMX stepper/servo motor fails to move when controlled by generic serial code because it relies on a strict proprietary framing protocol (**TITAN-ASCII**), requires explicit fault clearing and servo enabling (`SVON`), and demands external high-voltage DC power (24–48 V) that cannot be drawn from the USB port.
+
+Claude Sonnet can use the following technical specifications, protocol definitions, initialization sequences, and code examples to correct the application.
+
+---
+
+### 1. Hardware & Electrical Checks
+
+Before troubleshooting software, verify the hardware prerequisites:
+* **Auxiliary Power Supply (Crucial)**: The USB interface only powers the internal logic and FTDI/Virtual COM Port (VCP). The motor coils **require external 24 VDC to 48 VDC** connected to the 5-pin M12 (or DSUB-15) power connector. If only the USB cable is plugged in, the COM port will enumerate, but the motor will have zero drive power to physically move.
+* **Digital Input / Limit Interlocks**: TITAN-IMX features opto-isolated limit inputs (+Limit, -Limit, Home). If the controller is configured to expect normally-closed (NC) limits and nothing is wired, the drive will trigger a limit fault immediately upon boot and reject all motion commands.
+
+---
+
+### 2. Serial Port Communication Parameters
+
+The TITAN-IMX virtual COM port operates with the following default serial settings:
+* **Baud Rate**: `115200 bps` (a very common failure cause is guessing `9600`)
+* **Data Bits**: `8`
+* **Parity**: `None`
+* **Stop Bits**: `1`
+* **Flow Control**: `None`
+* **Line Terminator**: Carriage Return + Line Feed (`\r\n` or ASCII `13, 10`)
+
+---
+
+### 3. TITAN-ASCII Protocol Framing Syntax
+
+Arcus TITAN controllers do not accept bare commands like `MOVE 1000` or `X=1000`. If the packet header or network ID is missing or incorrect, **the controller silently ignores the packet and sends no reply**.
+
+* **Command Format (Master $\rightarrow$ Motor)**:
+  $$\mathbf{@\text{<ID>}:\text{<COMMAND>}[=\text{<VALUE>}]\backslash r\backslash n}$$
+  * `@`: Mandatory start character.
+  * `<ID>`: 2-digit device Network ID (factory default is `01`).
+  * `:`: Mandatory delimiter/separation character.
+  * `<COMMAND>`: The ASCII command keyword.
+  * `\r\n`: Carriage Return (`0x0D`) followed by Line Feed (`0x0A`).
+
+* **Response Format (Motor $\rightarrow$ Master)**:
+  $$\mathbf{\#\text{<ID>}:\text{<COMMAND>}=\text{<VALUE>}\backslash r\backslash n}$$
+  * `#`: Start character for controller replies.
+  * Valid command example: `@01:MST\r\n` $\rightarrow$ Reply: `#01:MST=0x0\r\n`.
+  * Invalid command example: `@01:FOO\r\n` $\rightarrow$ Reply: `#01:FOO=?\r\n` (or error code).
+
+---
+
+### 4. Why the Motor Did Not Move: The Required Motion Sequence
+
+A motor will not accept motion commands until the driver is cleared of faults and energized. The application must execute the following handshake sequence in order:
+
+1. **Clear Fault State**: Send `@01:ECLEARX\r\n` (clears limit trip, position error, or boot faults).
+2. **Energize / Enable Servo**: Send `@01:SVON\r\n` (turns the closed-loop servo driver ON; you should feel holding torque).
+3. **Configure Motion Profiling**:
+   * Set High/Target Speed: `@01:HSPD=10000\r\n`
+   * Set Acceleration: `@01:ACC=50000\r\n`
+4. **Command Motion**:
+   * **Absolute Move**: `@01:X=32000\r\n` (TITAN-IMX optical encoders typically have 32,000 counts per revolution).
+   * **Relative Jog**: `@01:JOGX+\r\n` or `@01:JOGX-\r\n` (and `@01:STOPX\r\n` to halt).
+5. **Poll Status**: Read `@01:MST\r\n` to verify whether the motor is in motion, in position, or in fault.
+
+---
+
+### 5. Essential TITAN-ASCII Command Reference
+
+| Command | Type | Description / Example |
+|---|---|---|
+| **`@01:MST`** | Read | Query Motor Status bitmask (e.g., in motion, homing, fault). |
+| **`@01:FLT`** | Read | Query Motor Fault Register bitmask (e.g., bit 0 = limit error). |
+| **`@01:ECLEARX`** | Action | Clear motor error/fault state. |
+| **`@01:SVON`** | Action | Enable motor coils / turn closed-loop servo ON. |
+| **`@01:SVOFF`** | Action | Disable motor coils / turn servo OFF. |
+| **`@01:EX`** | Read/Write | Query/Set actual encoder position counts (`@01:EX=0` zeros position). |
+| **`@01:X=<pos>`** | Action | Execute target move to absolute position `<pos>`. |
+| **`@01:HSPD=<val>`** | Parameter | Set operating running speed (counts/sec). |
+| **`@01:ACC=<val>`** | Parameter | Set acceleration / deceleration rate. |
+| **`@01:STOPX`** | Action | Decelerate and stop motor motion. |
+| **`@01:ABORTX`** | Action | Immediate emergency stop. |
+
+---
+
+### 6. Reference Python Implementation for Claude
+
+Claude can use or adapt this Python controller class using `pyserial`:
+
+```python
+import time
+import serial
+
+
+class ArcusTitanIMX:
+
+  def __init__(self, port: str, device_id: int = 1, timeout: float = 0.5):
+    self.port = port
+    self.device_id = f"{device_id:02d}"
+    # TITAN-IMX requires 115200 8N1
+    self.ser = serial.Serial(
+        port=self.port,
+        baudrate=115200,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=timeout,
+    )
+    time.sleep(0.1)
+
+  def send_cmd(self, cmd: str) -> str:
+    """Formats and transmits a TITAN-ASCII packet: @<ID>:<CMD>\r\n."""
+    packet = f"@{self.device_id}:{cmd}\r\n".encode("ascii")
+    self.ser.reset_input_buffer()
+    self.ser.write(packet)
+    reply = self.ser.readline().decode("ascii", errors="ignore").strip()
+    return reply
+
+  def initialize(self):
+    print("Testing connection...")
+    resp = self.send_cmd("MST")
+    if not resp.startswith(f"#{self.device_id}"):
+      raise ConnectionError(
+          f"No response from motor at ID {self.device_id}. Got: {resp}"
+      )
+    print(f"Connected: Status = {resp}")
+
+    # 1. Clear any active faults
+    print("Clearing faults...")
+    self.send_cmd("ECLEARX")
+    time.sleep(0.05)
+
+    # 2. Turn servo ON
+    print("Enabling servo drive (SVON)...")
+    self.send_cmd("SVON")
+    time.sleep(0.1)
+
+    # 3. Set default motion profile
+    self.send_cmd("HSPD=10000")  # Running speed
+    self.send_cmd("ACC=50000")  # Acceleration
+
+  def move_to(self, target_counts: int):
+    """Absolute target move."""
+    print(f"Moving to position: {target_counts}")
+    return self.send_cmd(f"X={target_counts}")
+
+  def get_position(self) -> int:
+    """Reads actual encoder position."""
+    resp = self.send_cmd("EX")  # format: #01:EX=12345
+    if "=" in resp:
+      return int(resp.split("="))
+    return 0
+
+  def stop(self):
+    return self.send_cmd("STOPX")
+
+  def close(self):
+    self.send_cmd("SVOFF")
+    self.ser.close()
+
+
+if __name__ == "__main__":
+  # Replace with your enumerated COM port (e.g., 'COM3' or '/dev/ttyUSB0')
+  motor = ArcusTitanIMX(port="COM3", device_id=1)
+  try:
+    motor.initialize()
+    print(f"Current Position: {motor.get_position()}")
+
+    # Execute a move of 1 revolution (approx 32,000 counts)
+    motor.move_to(32000)
+
+    # Poll until movement finishes
+    for _ in range(20):
+      time.sleep(0.2)
+      pos = motor.get_position()
+      print(f"Encoder Pos: {pos}")
+  finally:
+    motor.close()
+```
+
+---
+
+### 7. Immediate Sanity Check with a Serial Terminal
+
+Before recompiling the application, test the COM port directly with a terminal tool (such as PuTTY, Tera Term, or Serial Studio):
+1. Open the enumerated COM port at **`115200 baud, 8-N-1`**.
+2. Set the transmit line ending to send **`CR+LF`** (`\r\n`).
+3. Type `@01:MST` and press Enter.
+   * If you receive `#01:MST=0x...`, communication is working.
+   * Then type `@01:ECLEARX` followed by `@01:SVON`. You should hear or feel the motor coils energize into position lock.
+   * Type `@01:X=10000` to trigger a position move.
